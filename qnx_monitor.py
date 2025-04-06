@@ -9,6 +9,7 @@ import queue
 import argparse
 import ipaddress
 from datetime import datetime
+import re
 
 class QNXMonitor:
     def __init__(self, namespace="default", label_selector="app=qnx", refresh_interval=5, manual_ips=None):
@@ -21,6 +22,21 @@ class QNXMonitor:
         self.stop_event = threading.Event()
         self.container_status_lock = threading.Lock()
         self.ip_mode = manual_ips is not None
+
+        self.log_colors = [
+                    # Priority order matters - first match wins
+                    (r'\b(error|failed|unreachable)\b', 3),      # Red
+                    (r'\[SYN\]', 6),                             # Magenta
+                    (r'\[FIN\]', 3),                              # Red
+                    (r'\[ACK\]', 7),                              # Blue
+                    (r'\b(reachable)\b', 1),                      # Green
+                    (r'\b(ping: [\d.]+ms)\b', 2),                 # Yellow
+                    (r'\b(idle|pending)\b', 8),                   # Yellow
+                    (r'\b(received|sent|data)\b', 7),             # Blue
+                    (r'\b(connected)\b', 1),                      # Green
+                    (r'\d+\.\d+\.\d+\.\d+', 4)                    # Cyan for IP addresses
+                ]
+        self.compiled_colors = [(re.compile(pattern, re.IGNORECASE), color) for pattern, color in self.log_colors]
 
     def get_containers(self):
         """Get all QNX containers and their details"""
@@ -114,18 +130,16 @@ class QNXMonitor:
             # Build tcpdump filter to capture traffic between QNX containers
             filter_expr = " or ".join([f"host {ip}" for ip in pod_ips])
 
+            # Enhanced tcpdump command with more verbosity
             if self.ip_mode:
-                # In IP mode, we run tcpdump directly on the host
-                # This requires the script to be run on a node with tcpdump installed
-                cmd = ["tcpdump", "-l", "-n", filter_expr]
+                cmd = ["tcpdump", "-l", "-n", "-v", filter_expr]
             else:
-                # In Kubernetes mode, run tcpdump on a kube-proxy pod
                 cmd = [
                     "kubectl", "exec",
                     "-n", "kube-system",
                     "$(kubectl get pods -n kube-system -l k8s-app=kube-proxy -o jsonpath='{.items[0].metadata.name}')",
                     "--",
-                    "tcpdump", "-l", "-n", filter_expr
+                    "tcpdump", "-l", "-n", "-v", filter_expr
                 ]
 
             # Execute command
@@ -137,16 +151,41 @@ class QNXMonitor:
                 process = subprocess.Popen(full_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                     shell=True, text=True)
 
+            tcp_pattern = re.compile(
+                r'(\d+:\d+:\d+\.\d+) IP (\d+\.\d+\.\d+\.\d+)\.(\d+) > (\d+\.\d+\.\d+\.\d+)\.(\d+): Flags (\S+).*?(\d+) (\w+)'
+            )
+
             while not self.stop_event.is_set():
                 line = process.stdout.readline()
                 if not line:
                     break
 
-                timestamp = datetime.now().strftime("%H:%M:%S")
-                log_entry = f"[TCP:{timestamp}] {line.strip()}"
-                self.log_queue.put(log_entry)
+                # Parse TCP line
+                match = tcp_pattern.search(line)
+                if match:
+                    timestamp, src_ip, src_port, dst_ip, dst_port, flags, seq, ack = match.groups()
+                    event = ""
+                    if 'S' in flags and 'A' not in flags:
+                        event = "SYN (New connection)"
+                        color_tag = "[SYN]"
+                    elif 'F' in flags:
+                        event = "FIN (Connection close)"
+                        color_tag = "[FIN]"
+                    elif 'A' in flags and 'S' not in flags:
+                        event = "ACK (Acknowledgment)"
+                        color_tag = "[ACK]"
+                    else:
+                        event = "Data transfer"
+                        color_tag = "[DATA]"
 
-                # Update connection information between pods
+                    log_entry = (
+                        f"[TCP:{datetime.now().strftime('%H:%M:%S')}] {color_tag} {src_ip}:{src_port} → "
+                        f"{dst_ip}:{dst_port} {event} Seq: {seq} Ack: {ack}"
+                    )
+                else:
+                    log_entry = f"[TCP:{datetime.now().strftime('%H:%M:%S')}] {line.strip()}"
+
+                self.log_queue.put(log_entry)
                 self._update_connections(line.strip())
 
         except Exception as e:
@@ -154,12 +193,49 @@ class QNXMonitor:
 
     def _update_connections(self, tcp_line):
         """Update connection information between pods based on TCP traffic"""
+        # Enhanced TCP pattern to extract more information
+        tcp_pattern = re.compile(
+            r'IP (\d+\.\d+\.\d+\.\d+)\.(\d+) > (\d+\.\d+\.\d+\.\d+)\.(\d+): '
+            r'Flags \[([^\]]+)\], seq (\d+):?(\d+)?, (ack (\d+))?, win (\d+)'
+            r'(?:, options \[([^\]]+)\])?(?:, length (\d+))?'
+        )
+        match = tcp_pattern.search(tcp_line)
+
+        connection_details = {}
+        if match:
+            src_ip, src_port, dst_ip, dst_port, flags, seq_start, seq_end, _, ack_num, win, options, length = match.groups()
+            connection_details = {
+                'src_ip': src_ip,
+                'src_port': src_port,
+                'dst_ip': dst_ip,
+                'dst_port': dst_port,
+                'flags': flags,
+                'seq': seq_start + (f":{seq_end}" if seq_end else ""),
+                'ack': ack_num,
+                'win': win,
+                'options': options,
+                'length': length
+            }
+
         with self.container_status_lock:
             for src_pod_name, src_pod in self.containers.items():
                 if src_pod["ip"] != "Pending" and src_pod["ip"] in tcp_line:
                     for dst_pod_name, dst_pod in self.containers.items():
                         if dst_pod_name != src_pod_name and dst_pod["ip"] != "Pending" and dst_pod["ip"] in tcp_line:
                             src_pod["connected_to"].add(dst_pod_name)
+
+                            # Store connection details in the pod info
+                            if "connection_history" not in src_pod:
+                                src_pod["connection_history"] = []
+
+                            if connection_details:
+                                # Add timestamp
+                                connection_details['timestamp'] = datetime.now().isoformat()
+                                connection_details['target_pod'] = dst_pod_name
+                                src_pod["connection_history"].append(connection_details)
+                                # Keep only the last 100 connection records
+                                if len(src_pod["connection_history"]) > 100:
+                                    src_pod["connection_history"].pop(0)
 
     def capture_container_logs(self, pod_name):
         """Capture logs from a specific container"""
@@ -210,8 +286,14 @@ class QNXMonitor:
                             result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
                             if result.returncode == 0:
+                                time_match = re.search(r'time=([\d.]+)\s*ms', result.stdout)
+                                if time_match:
+                                    time_ms = time_match.group(1)
+                                    log_msg = f"[{pod_name}:{datetime.now().strftime('%H:%M:%S')}] Host {ip} is reachable (ping: {time_ms}ms)"
+                                else:
+                                    log_msg = f"[{pod_name}:{datetime.now().strftime('%H:%M:%S')}] Host {ip} is reachable"
                                 self.containers[pod_name]["status"] = "Reachable"
-                                self.log_queue.put(f"[{pod_name}:{datetime.now().strftime('%H:%M:%S')}] Host {ip} is reachable")
+                                self.log_queue.put(log_msg)
                             else:
                                 self.containers[pod_name]["status"] = "Unreachable"
                                 self.log_queue.put(f"[{pod_name}:{datetime.now().strftime('%H:%M:%S')}] Unable to reach host {ip}")
@@ -254,6 +336,84 @@ class QNXMonitor:
 
             time.sleep(self.refresh_interval)
 
+    def get_log_color(self, log_line):
+        """Returns a list of (start_pos, end_pos, color_pair) for colored segments"""
+        colored_segments = []
+        for pattern, color in self.compiled_colors:
+            for match in pattern.finditer(log_line):
+                colored_segments.append((match.start(), match.end(), curses.color_pair(color)))
+        return colored_segments
+
+
+    def display_connection_stats(self, stdscr):
+        """Display detailed connection statistics in a new view"""
+        curses.curs_set(0)
+        height, width = stdscr.getmaxyx()
+
+        try:
+            while True:
+                stdscr.clear()
+
+                # Display header
+                header = " QNX Connection Statistics "
+                stdscr.addstr(0, 0, header.center(width), curses.color_pair(5) | curses.A_BOLD)
+
+                row = 2
+                with self.container_status_lock:
+                    for pod_name, pod_info in sorted(self.containers.items()):
+                        if "connection_history" in pod_info and pod_info["connection_history"]:
+                            stdscr.addstr(row, 0, f"Pod: {pod_name}", curses.color_pair(4) | curses.A_BOLD)
+                            row += 1
+
+                            # Display connection summary
+                            connections_by_target = {}
+                            for conn in pod_info["connection_history"]:
+                                target = conn.get('target_pod', 'unknown')
+                                if target not in connections_by_target:
+                                    connections_by_target[target] = {'count': 0, 'data_bytes': 0}
+                                connections_by_target[target]['count'] += 1
+                                if conn.get('length'):
+                                    connections_by_target[target]['data_bytes'] += int(conn.get('length', 0))
+
+                            for target, stats in connections_by_target.items():
+                                if row < height - 1:
+                                    stdscr.addstr(row, 2, f"→ {target}: {stats['count']} packets, {stats['data_bytes']} bytes")
+                                    row += 1
+
+                            # Show recent connections
+                            if row < height - 1:
+                                stdscr.addstr(row, 2, "Recent connections:", curses.A_BOLD)
+                                row += 1
+
+                            for conn in reversed(pod_info["connection_history"][-5:]):  # Show last 5 connections
+                                if row < height - 1:
+                                    timestamp = conn.get('timestamp', '').split('T')[1][:8]
+                                    flags = conn.get('flags', '')
+                                    src_port = conn.get('src_port', '')
+                                    dst_port = conn.get('dst_port', '')
+                                    length = conn.get('length', '0')
+                                    target = conn.get('target_pod', 'unknown')
+
+                                    conn_str = f"{timestamp} {flags} → {target}:{dst_port} ({length} bytes)"
+                                    stdscr.addstr(row, 4, conn_str)
+                                    row += 1
+
+                            row += 1  # Add space between pods
+
+                # Key help
+                stdscr.addstr(height-1, 0, "Press 'b' to go back", curses.color_pair(5))
+
+                stdscr.refresh()
+
+                # Check for key input
+                stdscr.timeout(500)
+                key = stdscr.getch()
+                if key == ord('b'):
+                    break
+
+        except Exception as e:
+            self.log_queue.put(f"Error in connection stats: {str(e)}")
+
     def display_ui(self, stdscr):
         """Display the monitoring UI using curses"""
         curses.curs_set(0)  # Hide cursor
@@ -266,6 +426,9 @@ class QNXMonitor:
         curses.init_pair(3, curses.COLOR_RED, -1)  # Failed/Error/Unreachable
         curses.init_pair(4, curses.COLOR_CYAN, -1)  # Headers
         curses.init_pair(5, curses.COLOR_WHITE, curses.COLOR_BLUE)  # Header background
+        curses.init_pair(6, curses.COLOR_MAGENTA, -1)   # SYN
+        curses.init_pair(7, curses.COLOR_BLUE, -1)      # Data/ACK
+        curses.init_pair(8, curses.COLOR_YELLOW, -1)    # Pending/Idle
 
         # Start monitoring in a separate thread
         monitor_thread = threading.Thread(target=self.monitor_containers)
@@ -339,22 +502,19 @@ class QNXMonitor:
                 log_slice = logs[-available_rows:] if available_rows > 0 else []
 
                 for i, log in enumerate(log_slice):
-                    if log_start_row + i < height:
-                        # Truncate log if too long for screen
-                        log_display = log[:width-1] if len(log) > width-1 else log
+                        if log_start_row + i < height:
+                            log_display = log[:width-1] if len(log) > width-1 else log
+                            colored_segments = self.get_log_color(log_display)
 
-                        # Color based on log type
-                        if "[TCP:" in log:
-                            stdscr.addstr(log_start_row + i, 0, log_display, curses.color_pair(4))
-                        elif "Error" in log or "error" in log or "ERROR" in log or "Unreachable" in log:
-                            stdscr.addstr(log_start_row + i, 0, log_display, curses.color_pair(3))
-                        elif "Reachable" in log:
-                            stdscr.addstr(log_start_row + i, 0, log_display, curses.color_pair(1))
-                        else:
+                            # Display the log line first in default color
                             stdscr.addstr(log_start_row + i, 0, log_display)
 
+                            # Then overlay the colored segments
+                            for start, end, color in colored_segments:
+                                if start < width and end <= width:
+                                    stdscr.addstr(log_start_row + i, start, log_display[start:end], color)
                 # Status line
-                status_line = "Press 'q' to exit | Press 'c' to clear logs"
+                status_line = "Press 'q' to exit | 'c' to clear logs | 's' for connection stats"
                 stdscr.addstr(height-1, 0, status_line.ljust(width-1), curses.color_pair(5))
 
                 stdscr.refresh()
@@ -366,6 +526,8 @@ class QNXMonitor:
                     break
                 elif key == ord('c'):
                     logs.clear()
+                elif key == ord('s'):
+                    self.display_connection_stats(stdscr)
 
         except KeyboardInterrupt:
             pass
