@@ -156,10 +156,10 @@ class QNXMonitor:
         self.arpspoof_processes = []
         spoofed_pairs = set()
 
-        for i in range(len(private_ips_to_spoof)):
-            for j in range(i + 1, len(private_ips_to_spoof)):
-                ip_a = private_ips_to_spoof[i]
-                ip_b = private_ips_to_spoof[j]
+        for i in range(len(self.ips)):
+            for j in range(i + 1, len(self.ips)):
+                ip_a = self.ips[i]
+                ip_b = self.ips[j]
                 pair = tuple(sorted((ip_a, ip_b)))
 
                 if pair in spoofed_pairs:
