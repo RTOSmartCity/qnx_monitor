@@ -1,14 +1,14 @@
 services:
   qnx-monitor:
     build:
+      network: host
       context: .
       dockerfile: Dockerfile
     container_name: qnx-monitor
     command: --ip-file /app/config/ips.txt
     volumes:
-      - ${HOME}/.kube:/root/.kube:ro
       - ./config:/app/config:ro
     tty: true
+    network_mode: "host"
     stdin_open: true
     restart: unless-stopped
-    privileged: true

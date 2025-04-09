@@ -11,9 +11,11 @@ import re
 import subprocess
 
 class QNXMonitor:
-    def __init__(self, ips, refresh_interval=5):
+    def __init__(self, ips, refresh_interval=5, ports=None, all_ports=False):
         self.refresh_interval = refresh_interval
         self.ips = ips
+        self.ports = ports  # Specific ports to monitor
+        self.all_ports = all_ports  # Flag to monitor all ports
         self.containers = {}
         self.log_queue = queue.Queue()
         self.stop_event = threading.Event()
@@ -27,6 +29,14 @@ class QNXMonitor:
             (r'\[ACK\]', 7),                              # Blue
             (r'\b(reachable)\b', 1),                      # Green
             (r'\b(ping: [\d.]+ms)\b', 2),                 # Yellow
+            (r'\[TCPDUMP_DEBUG\]', 8),      # Yellow for debug
+            (r'\[TCPDUMP_COMMAND\]', 4),    # Cyan for commands
+            (r'\[TCPDUMP_PROCESS\]', 4),    # Cyan for process info
+            (r'\[TCPDUMP_STDOUT\]', 7),     # Blue for stdout
+            (r'\[TCPDUMP_STDERR\]', 3),     # Red for stderr
+            (r'\[TCPDUMP_PARSE\]', 2),      # Yellow for parsed
+            (r'\[TCPDUMP_WARNING\]', 2),    # Yellow for warnings
+            (r'\[TCPDUMP_ERROR\]', 3),      # Red for errors
             (r'\b(idle|pending)\b', 8),                   # Yellow
             (r'\b(received|sent|data)\b', 7),             # Blue
             (r'\b(connected)\b', 1),                      # Green
@@ -54,64 +64,121 @@ class QNXMonitor:
             return False
 
     def capture_tcp_traffic(self):
-        """Use tcpdump to capture TCP traffic between QNX containers"""
+        """Use tcpdump to capture TCP traffic between QNX containers with full verbosity"""
         try:
             # Get all pod IPs to create a filter expression
             with self.container_status_lock:
                 pod_ips = [pod["ip"] for pod in self.containers.values()]
+                self.log_queue.put(f"[TCPDUMP_DEBUG] Current monitored IPs: {', '.join(pod_ips)}")
 
             if not pod_ips:
-                time.sleep(5)  # Wait a bit if no IPs are available yet
+                self.log_queue.put("[TCPDUMP_WARNING] No IP addresses available for monitoring, waiting...")
+                time.sleep(5)
                 return
 
-            # Build tcpdump filter to capture traffic between QNX containers
-            filter_expr = " or ".join([f"host {ip}" for ip in pod_ips])
+            # Build tcpdump filter
+            ip_filter = " or ".join([f"host {ip}" for ip in pod_ips])
+            self.log_queue.put(f"[TCPDUMP_DEBUG] Generated IP filter: {ip_filter}")
 
-            # Enhanced tcpdump command with more verbosity
+            # Port filtering logic
+            port_filter = ""
+            if self.ports and not self.all_ports:
+                port_expressions = [f"port {port}" for port in self.ports]
+                port_filter = " or ".join(port_expressions)
+                self.log_queue.put(f"[TCPDUMP_DEBUG] Generated port filter: {port_filter}")
+
+                filter_expr = f"({ip_filter}) and ({port_filter})" if ip_filter and port_filter else port_filter
+            else:
+                filter_expr = ip_filter
+                self.log_queue.put("[TCPDUMP_DEBUG] Monitoring all ports between specified IPs")
+
+            self.log_queue.put(f"[TCPDUMP_DEBUG] Final filter expression: {filter_expr}")
+
+            # Build tcpdump command
             cmd = ["tcpdump", "-l", "-n", "-v", filter_expr]
+            cmd_str = " ".join(cmd)
+            self.log_queue.put(f"[TCPDUMP_COMMAND] Executing: {cmd_str}")
 
             # Execute command
-            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+                universal_newlines=True
+            )
+            self.log_queue.put(f"[TCPDUMP_PROCESS] Started tcpdump with PID: {process.pid}")
 
+            # Patterns for parsing
             tcp_pattern = re.compile(
                 r'(\d+:\d+:\d+\.\d+) IP (\d+\.\d+\.\d+\.\d+)\.(\d+) > (\d+\.\d+\.\d+\.\d+)\.(\d+): Flags (\S+).*?(\d+) (\w+)'
             )
 
+            last_traffic_time = time.time()
+            last_warning_time = 0
+            warning_interval = 10
+
+            def log_tcpdump_output(source, line):
+                """Helper to log output with timestamp and source"""
+                timestamp = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+                self.log_queue.put(f"[TCPDUMP_{source}:{timestamp}] {line.strip()}")
+
+            # Monitor both stdout and stderr
             while not self.stop_event.is_set():
-                line = process.stdout.readline()
-                if not line:
-                    break
+                # Check stdout
+                stdout_line = process.stdout.readline()
+                if stdout_line:
+                    log_tcpdump_output("STDOUT", stdout_line)
+                    last_traffic_time = time.time()
 
-                # Parse TCP line
-                match = tcp_pattern.search(line)
-                if match:
-                    timestamp, src_ip, src_port, dst_ip, dst_port, flags, seq, ack = match.groups()
-                    event = ""
-                    if 'S' in flags and 'A' not in flags:
-                        event = "SYN (New connection)"
-                        color_tag = "[SYN]"
-                    elif 'F' in flags:
-                        event = "FIN (Connection close)"
-                        color_tag = "[FIN]"
-                    elif 'A' in flags and 'S' not in flags:
-                        event = "ACK (Acknowledgment)"
-                        color_tag = "[ACK]"
-                    else:
-                        event = "Data transfer"
-                        color_tag = "[DATA]"
+                    # Parse TCP line if it matches our pattern
+                    match = tcp_pattern.search(stdout_line)
+                    if match:
+                        timestamp, src_ip, src_port, dst_ip, dst_port, flags, seq, ack = match.groups()
+                        event_type = {
+                            'S': 'SYN (Connection initiation)',
+                            'F': 'FIN (Connection termination)',
+                            'A': 'ACK (Acknowledgement)',
+                            'P': 'PSH (Data push)',
+                            'R': 'RST (Reset)'
+                        }
+                        events = [event_type[f] for f in event_type if f in flags]
+                        event = " + ".join(events) if events else "Data transfer"
+                        
+                        log_tcpdump_output("PARSE", (
+                            f"Packet: {src_ip}:{src_port} → {dst_ip}:{dst_port} | "
+                            f"Flags: {flags} ({event}) | "
+                            f"Seq: {seq} | Ack: {ack}"
+                        ))
+                    self._update_connections(stdout_line)
 
-                    log_entry = (
-                        f"[TCP:{datetime.now().strftime('%H:%M:%S')}] {color_tag} {src_ip}:{src_port} → "
-                        f"{dst_ip}:{dst_port} {event} Seq: {seq} Ack: {ack}"
-                    )
-                else:
-                    log_entry = f"[TCP:{datetime.now().strftime('%H:%M:%S')}] {line.strip()}"
+                # Check stderr
+                stderr_line = process.stderr.readline()
+                if stderr_line:
+                    log_tcpdump_output("STDERR", stderr_line)
 
-                self.log_queue.put(log_entry)
-                self._update_connections(line.strip())
+                # No output case
+                if not stdout_line and not stderr_line:
+                    current_time = time.time()
+                    if (current_time - last_traffic_time) > warning_interval:
+                        if (current_time - last_warning_time) > warning_interval:
+                            log_tcpdump_output("WARNING", 
+                                f"No TCP traffic detected for {warning_interval} seconds. "
+                                f"Filter: {filter_expr}"
+                            )
+                            last_warning_time = current_time
+                    time.sleep(0.1)  # Prevent CPU overload
+
+            # Process ended
+            return_code = process.poll()
+            if return_code is not None:
+                log_tcpdump_output("STATUS", f"tcpdump process ended with return code: {return_code}")
 
         except Exception as e:
-            self.log_queue.put(f"Error capturing TCP traffic: {str(e)}")
+            error_time = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+            self.log_queue.put(f"[TCPDUMP_ERROR:{error_time}] {str(e)}")
+            self.log_queue.put(f"[TCPDUMP_ERROR:{error_time}] Traceback: {traceback.format_exc()}")
 
     def _update_connections(self, tcp_line):
         """Update connection information between pods based on TCP traffic"""
@@ -321,6 +388,12 @@ class QNXMonitor:
 
                 # Display header
                 header = f" QNX IP Monitor - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} "
+                if self.all_ports:
+                    header += " (ALL PORTS) "
+                elif self.ports:
+                    port_str = ", ".join(map(str, self.ports))
+                    header += f" (Ports: {port_str}) "
+
                 stdscr.addstr(0, 0, header.center(width), curses.color_pair(5) | curses.A_BOLD)
 
                 # Display container information
@@ -401,11 +474,29 @@ def validate_ip(ip):
     except ValueError:
         raise argparse.ArgumentTypeError(f"Invalid IP address: {ip}")
 
+def validate_port(port_str):
+    """Validate that a port is a number between 1 and 65535"""
+    try:
+        port = int(port_str)
+        if 1 <= port <= 65535:
+            return port
+        raise ValueError
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"Invalid port number: {port_str}. Must be between 1 and 65535.")
+
 def main():
     parser = argparse.ArgumentParser(description='Monitor QNX hosts by IP addresses')
     parser.add_argument('--refresh', '-r', type=int, default=5, help='Status refresh interval in seconds')
     parser.add_argument('--ips', '-i', type=validate_ip, nargs='+', help='List of IP addresses to monitor')
     parser.add_argument('--ip-file', '-f', help='File containing IP addresses to monitor (one per line)')
+
+    # Port filtering options - create a mutually exclusive group
+    port_group = parser.add_mutually_exclusive_group()
+    port_group.add_argument('--ports', '-p', type=validate_port, nargs='+',
+                        help='Specific ports to monitor (e.g., 8080, 443, etc.)')
+    port_group.add_argument('--all-ports', '-a', action='store_true',
+                        help='Monitor all ports (default behavior)')
+
     args = parser.parse_args()
 
     # Process IP addresses
@@ -426,7 +517,9 @@ def main():
 
     monitor = QNXMonitor(
         ips=ips,
-        refresh_interval=args.refresh
+        refresh_interval=args.refresh,
+        ports=args.ports,
+        all_ports=args.all_ports or not args.ports  # Default to all ports if no ports specified
     )
 
     # Start the UI with curses
