@@ -9,7 +9,6 @@ import subprocess
 import signal
 import sys
 import traceback
-import ipaddress
 
 class QNXMonitor:
     def __init__(self, ips, refresh_interval=5, ports=None, all_ports=False, status_interval=30, enable_mitm=False): # Added enable_mitm
@@ -468,6 +467,9 @@ class QNXMonitor:
         ping_thread = threading.Thread(target=self.ping_containers, name="PingThread", daemon=True)
         ping_thread.start()
 
+        if self.enable_mitm:
+            self._start_arpspoofing()
+
         # Keep main thread alive
         while not self.stop_event.is_set():
             try:
@@ -524,10 +526,6 @@ class QNXMonitor:
         """Checks and logs the status of arpspoof processes."""
         if not self.enable_mitm: return # Only check if MitM was intended
 
-        if not self.arpspoof_processes:
-             self.log("MitM Status: No arpspoof processes were started or they have been stopped.", level="STATUS")
-             return
-
         running_count = 0
         stopped_count = 0
         running_pids = []
@@ -547,8 +545,6 @@ class QNXMonitor:
             self.log(f"MitM Status: {running_count} arpspoof processes Running (PIDs: {running_pids}), {stopped_count} Stopped (PIDs: {stopped_pids})", level="WARN")
         elif running_count == 0 and stopped_count > 0:
              self.log(f"MitM Status: All {stopped_count} arpspoof processes Stopped (PIDs: {stopped_pids})", level="WARN")
-        else: # Should not happen if list is not empty
-             self.log("MitM Status: Inconsistent state checking arpspoof processes.", level="ERROR")
 
 
     def print_status_summary(self):
