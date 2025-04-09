@@ -31,6 +31,8 @@ class QNXMonitor:
         signal.signal(signal.SIGINT, self.signal_handler)
         signal.signal(signal.SIGTERM, self.signal_handler)
 
+        self.mitm_interface = self._detect_interface()
+        
         #if self.enable_mitm:
             #self._check_prerequisites()
 
