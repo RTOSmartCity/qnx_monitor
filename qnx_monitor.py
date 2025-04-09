@@ -33,7 +33,7 @@ class QNXMonitor:
         signal.signal(signal.SIGTERM, self.signal_handler)
 
         if self.enable_mitm:
-            self._check_prerequisites()
+            #self._check_prerequisites()
 
 
     def _check_prerequisites(self):
