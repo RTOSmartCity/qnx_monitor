@@ -154,20 +154,6 @@ class QNXMonitor:
             return False
 
     def _start_arpspoofing(self):
-        """Starts arpspoof processes for pairs of monitored PRIVATE IPs."""
-        if not self.enable_mitm:
-            self.log("MitM is disabled, skipping ARP spoofing.", level="INFO")
-            return
-        if not self.mitm_interface:
-            self.log("MitM Error: Cannot start ARP spoofing without a valid network interface.", level="CRITICAL")
-            return
-
-        self.log(f"Starting ARP spoofing on interface {self.mitm_interface} for local private IP pairs...", level="INFO")
-
-        if len(private_ips_to_spoof) < 2:
-            self.log("MitM Info: Fewer than two private IPs provided. No ARP spoofing pairs to create.", level="INFO")
-            return
-
         self.arpspoof_processes = []
         spoofed_pairs = set()
 
