@@ -473,12 +473,6 @@ class QNXMonitor:
         """Starts the monitoring threads and keeps the main thread alive."""
         self.log("Starting QNX Monitor...", level="INFO")
 
-        if self.enable_mitm:
-            if self._check_prerequisites():
-                 self._start_arpspoofing()
-            else:
-                 self.log("MitM prerequisites failed. MitM features will not be active.", level="CRITICAL")
-
 
         # Start TCP traffic monitoring
         tcp_thread = threading.Thread(target=self.capture_tcp_traffic, name="TCPCaptureThread", daemon=True)
