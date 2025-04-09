@@ -1,14 +1,21 @@
 services:
   qnx-monitor:
     build:
-      network: host
+      # network: host # Build-time network usually doesn't need host mode
       context: .
       dockerfile: Dockerfile
     container_name: qnx-monitor
-    command: --ip-file /app/config/ips.txt
+    # Pass arguments via command
+    command: [
+        "--ip-file",
+        "/app/config/ips.txt",
+        "--all-ports",
+        "--refresh",
+        "15",
+      ] # Example command
     volumes:
       - ./config:/app/config:ro
-    tty: true
-    network_mode: "host"
-    stdin_open: true
+    network_mode: "host" # Essential for tcpdump to see host traffic
+    # tty: true # No longer needed
+    # stdin_open: true # No longer needed
     restart: unless-stopped
