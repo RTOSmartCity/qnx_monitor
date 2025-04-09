@@ -9,4 +9,4 @@ RUN chmod +x /app/qnx_monitor.py
 
 ENTRYPOINT ["python3", "/app/qnx_monitor.py"]
 
-CMD ["--ip-file", "/app/config/ips.txt", "--all-ports", "--enable-mitm"]
+CMD ["--ip-file", "/app/config/ips.txt", "--all-ports"]
