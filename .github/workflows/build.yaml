@@ -26,4 +26,4 @@ jobs:
         with:
           context: .
           push: true
-          tags: ${{ secrets.DOCKERHUB_USERNAME }}/:latest
+          tags: ${{ vars.DOCKERHUB_USERNAME }}/qnx-monitor-smart-city:latest
